@@ -22,6 +22,7 @@ setup(
     install_requires=[
         'click',
         'kafka-python>=1.3',
+        'python-snappy',
     ],
     entry_points={
         'console_scripts': [
