@@ -17,4 +17,4 @@ RUN pip install -e .
 COPY LICENSE /usr/src/app/
 COPY README.md /usr/src/app/
 
-CMD ["bash"]
+CMD ["sleep", "365d"]
