@@ -3,7 +3,7 @@ FROM python:3.6
 WORKDIR /usr/src/app
 
 RUN apt-get update \
-    && apt-get install -y libsnappy-dev \
+    && apt-get install -y libsnappy-dev jq \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
