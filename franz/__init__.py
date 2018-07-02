@@ -6,6 +6,7 @@ import sys
 
 from kafka import KafkaConsumer, KafkaProducer
 from kafka.structs import TopicPartition
+from kafka.partitioner.default import DefaultPartitioner
 
 
 def key_serializer(key):
@@ -88,6 +89,10 @@ def main():
                    ' e.g. broker1,broker2.' +
                    ' Ports can be provided if non-standard (9092)' +
                    ' e.g. broker1:9999. (default: localhost)')
+@click.option('-k', '--filter-key', multiple=True,
+              help='Filter results to a specific key.' +
+                   ' Provide option multiple times to filter by multiple keys.' +
+                   ' Assumes keys are partitioned with the default partitioner.')
 @click.option('-t', '--fetch-timeout', type=float, default=float('inf'),
               help='How long to wait for a message when fetching before ' +
                    'exiting. (default=indefinitely)')
@@ -100,6 +105,7 @@ def main():
               help='Turn on verbose logging.')
 def fetch(topic,
           bootstrap_brokers,
+          filter_key,
           fetch_timeout,
           json_value,
           readable,
@@ -107,6 +113,8 @@ def fetch(topic,
     '''Fetch a message, or messages, from a Kafka topic partition.
        By default, connect to a kafka cluster at localhost:9092 and fetch
        the message at the specified offset, outputting in JSON format.'''
+
+    filter_keys = filter_key
 
     logging.basicConfig(
         format='[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s',
@@ -118,7 +126,13 @@ def fetch(topic,
 
     for t in topic:
         # TODO: how to find this per topic...
-        all_partitions = range(8)
+        all_partitions = list(range(24))
+
+        if filter_keys:
+            partitioner = DefaultPartitioner()
+            filter_key_partitions = {partitioner(key_serializer(k), all_partitions, all_partitions)
+                                     for k in filter_keys}
+            all_partitions = [p for p in all_partitions if p in filter_key_partitions]
 
         # TODO: Parse topic spec properly and provide better error messages.
 
@@ -135,7 +149,21 @@ def fetch(topic,
         for s in slices:
             if '=' in s:
                 partition, s = s.split('=', 1)
-                partitions = [int(partition)]
+
+                if ':' in partition:
+                    start, end = partition.split(':', 1)
+
+                    if start == '':
+                        start = 0
+                    else:
+                        start = int(start)
+
+                    end = int(end)
+
+                    partitions = [p for p in range(start, end) if p in all_partitions]
+                else:
+                    partition = int(partition)
+                    partitions = [int(partition)] if partition in all_partitions else []
             else:
                 partitions = all_partitions
 
@@ -170,40 +198,49 @@ def fetch(topic,
         consumer_timeout_ms=fetch_timeout,
     )
 
+    message_count = 0
     try:
         for message in slice_consumer(topic_dict, consumer):
             value = message.value
             value_string = value
 
-            if json_value:
-                value = json.loads(value)
-                value_string = json.dumps(value,
-                                          indent=True,
-                                          ensure_ascii=False,
-                                          sort_keys=True)
+            if not filter_keys or message.key in filter_keys:
 
-            if readable:
-                print('[{}:{}:{}:{}] {}'.format(
-                      message.topic,
-                      message.partition,
-                      message.offset,
-                      message.key,
-                      value_string))
-            else:
-                output = {
-                    'topic': message.topic,
-                    'partition': message.partition,
-                    'offset': message.offset,
-                    'key': message.key,
-                    'value': value,
-                }
-                json.dump(output, sys.stdout, separators=(',', ':'))
-                sys.stdout.write('\n')
+                if json_value:
+                    value = json.loads(value)
+                    value_string = json.dumps(value,
+                                              indent=True,
+                                              ensure_ascii=False,
+                                              sort_keys=True)
 
-            sys.stdout.flush()
+                if readable:
+                    print('[{}:{}:{}:{}] {}'.format(
+                          message.topic,
+                          message.partition,
+                          message.offset,
+                          message.key,
+                          value_string))
+                else:
+                    output = {
+                        'topic': message.topic,
+                        'partition': message.partition,
+                        'offset': message.offset,
+                        'key': message.key,
+                        'value': value,
+                    }
+                    json.dump(output, sys.stdout, separators=(',', ':'))
+                    sys.stdout.write('\n')
+
+                sys.stdout.flush()
+
+            message_count += 1
+            if message_count % 1000 == 0:
+                logging.info('Fetched %(message_count)s messages', {'message_count': message_count})
 
     except KeyboardInterrupt:
         pass
+
+    logging.info('Fetched %(message_count)s messages', {'message_count': message_count})
 
     consumer.close()
 
