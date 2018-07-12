@@ -21,7 +21,7 @@ setup(
     packages=find_packages(),
     install_requires=[
         'click',
-        'kafka-python>=1.3',
+        'kafka-python>=1.4.2',
         'python-snappy',
     ],
     entry_points={

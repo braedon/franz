@@ -71,6 +71,21 @@ def slice_consumer(topic_dict, consumer):
             return
 
 
+def produce_batch(producer, topic, batch):
+    futures = []
+    for message in batch:
+        partition = message.get('partition')
+        key = message.get('key')
+        value = message.get('value')
+        future = producer.send(topic, partition=partition, key=key, value=value)
+        futures.append(future)
+
+    producer.flush()
+    # Get results now we've flushed, so any errors are thrown.
+    for future in futures:
+        future.get()
+
+
 CONTEXT_SETTINGS = {
     'help_option_names': ['-h', '--help']
 }
@@ -495,7 +510,88 @@ def produce(topic,
     producer.close()
 
 
+@click.command()
+@click.argument('source_topic')
+@click.argument('destination_topic')
+@click.option('-b', '--bootstrap-brokers', default='localhost',
+              help='Addresses of brokers in a Kafka cluster to talk to.' +
+                   ' Brokers should be separated by commas' +
+                   ' e.g. broker1,broker2.' +
+                   ' Ports can be provided if non-standard (9092)' +
+                   ' e.g. broker1:9999. (default: localhost)')
+@click.option('-g', '--consumer-group', default=None,
+              help='The consumer group to use. Offsets will be periodically' +
+                   ' committed.' +
+                   ' Consumption will start from the committed offsets,' +
+                   ' if available.')
+@click.option('-t', '--fetch-timeout', type=float, default=float('inf'),
+              help='How long to wait for a message when fetching before ' +
+                   'exiting. (default=indefinitely)')
+@click.option('-e', '--default-earliest-offset', is_flag=True,
+              help='Default to consuming from the earlest available offset if' +
+                   ' no committed offset is available.')
+@click.option('-v', '--verbose', is_flag=True,
+              help='Turn on verbose logging.')
+def pipe(source_topic,
+         destination_topic,
+         bootstrap_brokers,
+         consumer_group,
+         fetch_timeout,
+         default_earliest_offset,
+         verbose):
+    '''Consume messages from a Kafka topic, and produce to another Kafka topic.
+       By default, connect to a kafka cluster at localhost:9092 and consume new
+       messages on the source topic indefinitely, producing to the destination topic.'''
+
+    logging.basicConfig(
+        format='[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s',
+        level=logging.DEBUG if verbose else logging.INFO
+    )
+    logging.captureWarnings(True)
+
+    bootstrap_brokers = bootstrap_brokers.split(',')
+
+    consumer = KafkaConsumer(
+        source_topic,
+        bootstrap_servers=bootstrap_brokers,
+        value_deserializer=value_deserializer,
+        key_deserializer=key_deserializer,
+        auto_offset_reset='earliest' if default_earliest_offset else 'latest',
+        consumer_timeout_ms=fetch_timeout,
+        group_id=consumer_group,
+    )
+
+    producer = KafkaProducer(
+        bootstrap_servers=bootstrap_brokers,
+        value_serializer=value_serializer,
+        key_serializer=key_serializer,
+        # TODO: make configurable
+        acks='all'
+    )
+
+    try:
+        while True:
+            res = consumer.poll(timeout_ms=fetch_timeout)
+            if not res and fetch_timeout < float('inf'):
+                break
+
+            batch = [{'key': m.key, 'value': m.value}
+                     for messages in res.values()
+                     for m in messages]
+            logging.info('Piping batch of %(batch_size)d messages.',
+                         {'batch_size': len(batch)})
+            produce_batch(producer, destination_topic, batch)
+
+    except KeyboardInterrupt:
+        producer.close()
+        consumer.close(autocommit=False)
+    else:
+        producer.close()
+        consumer.close(autocommit=True)
+
+
 main.add_command(fetch)
 main.add_command(seek)
 main.add_command(consume)
 main.add_command(produce)
+main.add_command(pipe)
