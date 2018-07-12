@@ -453,11 +453,14 @@ def consume(topic,
                    ' e.g. broker1:9999. (default: localhost)')
 @click.option('-j', '--json-value', is_flag=True,
               help='Parse message values as JSON.')
+@click.option('-c', '--compression', type=click.Choice(['snappy']),
+              help='Which compression to use when producing messages. (default: None)')
 @click.option('-v', '--verbose', is_flag=True,
               help='Turn on verbose logging.')
 def produce(topic,
             bootstrap_brokers,
             json_value,
+            compression,
             verbose):
     '''Produce messages to a Kafka topic.
        By default, connect to a kafka cluster at localhost:9092.'''
@@ -475,7 +478,8 @@ def produce(topic,
         value_serializer=value_serializer,
         key_serializer=key_serializer,
         # TODO: make configurable
-        acks='all'
+        acks='all',
+        compression_type=compression,
     )
 
     try:
@@ -530,6 +534,8 @@ def produce(topic,
 @click.option('-e', '--default-earliest-offset', is_flag=True,
               help='Default to consuming from the earlest available offset if' +
                    ' no committed offset is available.')
+@click.option('-c', '--compression', type=click.Choice(['snappy']),
+              help='Which compression to use when producing messages. (default: None)')
 @click.option('-v', '--verbose', is_flag=True,
               help='Turn on verbose logging.')
 def pipe(source_topic,
@@ -538,6 +544,7 @@ def pipe(source_topic,
          consumer_group,
          fetch_timeout,
          default_earliest_offset,
+         compression,
          verbose):
     '''Consume messages from a Kafka topic, and produce to another Kafka topic.
        By default, connect to a kafka cluster at localhost:9092 and consume new
@@ -566,7 +573,8 @@ def pipe(source_topic,
         value_serializer=value_serializer,
         key_serializer=key_serializer,
         # TODO: make configurable
-        acks='all'
+        acks='all',
+        compression_type=compression,
     )
 
     try:
