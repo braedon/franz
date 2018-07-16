@@ -21,7 +21,8 @@ setup(
     packages=find_packages(),
     install_requires=[
         'click',
-        'kafka-python>=1.4.2',
+        'crc32c',
+        'kafka-python>=1.4.3',
         'python-snappy',
     ],
     entry_points={

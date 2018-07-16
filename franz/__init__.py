@@ -3,10 +3,13 @@ import json
 import logging
 import re
 import sys
+import time
 
 from kafka import KafkaConsumer, KafkaProducer
 from kafka.structs import TopicPartition
 from kafka.partitioner.default import DefaultPartitioner
+
+from .utils import OffsetManager, OffsetManagerRebalanceListener
 
 
 def key_serializer(key):
@@ -71,21 +74,6 @@ def slice_consumer(topic_dict, consumer):
             return
 
 
-def produce_batch(producer, topic, batch):
-    futures = []
-    for message in batch:
-        partition = message.get('partition')
-        key = message.get('key')
-        value = message.get('value')
-        future = producer.send(topic, partition=partition, key=key, value=value)
-        futures.append(future)
-
-    producer.flush()
-    # Get results now we've flushed, so any errors are thrown.
-    for future in futures:
-        future.get()
-
-
 CONTEXT_SETTINGS = {
     'help_option_names': ['-h', '--help']
 }
@@ -109,7 +97,7 @@ def main():
                    ' Provide option multiple times to filter by multiple keys.' +
                    ' Assumes keys are partitioned with the default partitioner.')
 @click.option('-t', '--fetch-timeout', type=float, default=float('inf'),
-              help='How long to wait for a message when fetching before ' +
+              help='How many seconds to wait for a message when fetching before ' +
                    'exiting. (default=indefinitely)')
 @click.option('-j', '--json-value', is_flag=True,
               help='Parse message values as JSON.')
@@ -210,7 +198,7 @@ def fetch(topic,
         bootstrap_servers=bootstrap_brokers,
         value_deserializer=value_deserializer,
         key_deserializer=key_deserializer,
-        consumer_timeout_ms=fetch_timeout,
+        consumer_timeout_ms=fetch_timeout * 1000,
     )
 
     message_count = 0
@@ -363,7 +351,7 @@ def seek(consumer_group,
                    ' Consumption will start from the committed offsets,' +
                    ' if available.')
 @click.option('-t', '--fetch-timeout', type=float, default=float('inf'),
-              help='How long to wait for a message when fetching before ' +
+              help='How many seconds to wait for a message when fetching before ' +
                    'exiting. (default=indefinitely)')
 @click.option('-e', '--default-earliest-offset', is_flag=True,
               help='Default to consuming from the earlest available offset if' +
@@ -401,7 +389,7 @@ def consume(topic,
         value_deserializer=value_deserializer,
         key_deserializer=key_deserializer,
         auto_offset_reset='earliest' if default_earliest_offset else 'latest',
-        consumer_timeout_ms=fetch_timeout,
+        consumer_timeout_ms=fetch_timeout * 1000,
         group_id=consumer_group
     )
 
@@ -480,10 +468,44 @@ def produce(topic,
         # TODO: make configurable
         acks='all',
         compression_type=compression,
+        # TODO: make these configurable?
+        linger_ms=100,
+        batch_size=131072,  # 128kB, default 32kB
     )
+
+    produce_buffer_size = 500
+
+    def free_queue_space(produce_buffer, ensure_space=False):
+        if not produce_buffer:
+            return produce_buffer
+
+        done = 0
+        for (tp, offset, fut) in produce_buffer:
+            if fut.is_done:
+                fut.get()
+                done += 1
+            else:
+                break
+
+        # If the buffer was full, and we were supposed to clear some space,
+        # and we haven't, wait until we can clear the first slot.
+        if len(produce_buffer) >= produce_buffer_size and ensure_space and not done:
+            tp, offset, fut = produce_buffer[0]
+            fut.get()
+            done += 1
+
+        new_produce_buffer = produce_buffer[done:]
+
+        return new_produce_buffer
+
+    produce_buffer = []
 
     try:
         for line in sys.stdin:
+
+            if len(produce_buffer) >= produce_buffer_size:
+                produce_buffer = free_queue_space(produce_buffer, ensure_space=True)
+
             message = json.loads(line)
             value = message['value']
             value_string = value
@@ -511,6 +533,9 @@ def produce(topic,
         pass
 
     producer.flush()
+    for (tp, offset, fut) in produce_buffer:
+        fut.get()
+
     producer.close()
 
 
@@ -529,7 +554,7 @@ def produce(topic,
                    ' Consumption will start from the committed offsets,' +
                    ' if available.')
 @click.option('-t', '--fetch-timeout', type=float, default=float('inf'),
-              help='How long to wait for a message when fetching before ' +
+              help='How many seconds to wait for a message when fetching before ' +
                    'exiting. (default=indefinitely)')
 @click.option('-e', '--default-earliest-offset', is_flag=True,
               help='Default to consuming from the earlest available offset if' +
@@ -559,13 +584,13 @@ def pipe(source_topic,
     bootstrap_brokers = bootstrap_brokers.split(',')
 
     consumer = KafkaConsumer(
-        source_topic,
         bootstrap_servers=bootstrap_brokers,
         value_deserializer=value_deserializer,
         key_deserializer=key_deserializer,
         auto_offset_reset='earliest' if default_earliest_offset else 'latest',
-        consumer_timeout_ms=fetch_timeout,
+        consumer_timeout_ms=min(fetch_timeout * 1000, 500),
         group_id=consumer_group,
+        enable_auto_commit=False,
     )
 
     producer = KafkaProducer(
@@ -575,27 +600,79 @@ def pipe(source_topic,
         # TODO: make configurable
         acks='all',
         compression_type=compression,
+        # TODO: make these configurable?
+        linger_ms=100,
+        batch_size=262144,  # 256kB, default 32kB
     )
 
-    try:
-        while True:
-            res = consumer.poll(timeout_ms=fetch_timeout)
-            if not res and fetch_timeout < float('inf'):
+    commit_interval = consumer.config['auto_commit_interval_ms'] / 1000
+    offset_manager = OffsetManager(consumer, commit_interval)
+    rebalance_listener = OffsetManagerRebalanceListener(offset_manager)
+
+    consumer.subscribe(topics=[source_topic], listener=rebalance_listener)
+
+    produce_buffer_size = 500
+
+    def free_queue_space(produce_buffer, ensure_space=False):
+        if not produce_buffer:
+            return produce_buffer
+
+        done = 0
+        for (tp, offset, fut) in produce_buffer:
+            if fut.is_done:
+                fut.get()
+                offset_manager.report_consumed(tp, offset)
+                done += 1
+            else:
                 break
 
-            batch = [{'key': m.key, 'value': m.value}
-                     for messages in res.values()
-                     for m in messages]
-            logging.info('Piping batch of %(batch_size)d messages.',
-                         {'batch_size': len(batch)})
-            produce_batch(producer, destination_topic, batch)
+        # If the buffer was full, and we were supposed to clear some space,
+        # and we haven't, wait until we can clear the first slot.
+        if len(produce_buffer) >= produce_buffer_size and ensure_space and not done:
+            tp, offset, fut = produce_buffer[0]
+            fut.get()
+            offset_manager.report_consumed(tp, offset)
+            done += 1
+
+        new_produce_buffer = produce_buffer[done:]
+
+        return new_produce_buffer
+
+    produce_buffer = []
+    last_message_time = time.monotonic()
+    try:
+        while time.monotonic() < (last_message_time + fetch_timeout):
+            for m in consumer:
+                last_message_time = time.monotonic()
+
+                if len(produce_buffer) >= produce_buffer_size:
+                    produce_buffer = free_queue_space(produce_buffer, ensure_space=True)
+
+                tp = TopicPartition(m.topic, m.partition)
+                offset = m.offset
+                args = {'topic': destination_topic, 'key': m.key, 'value': m.value}
+                fut = producer.send(**args)
+                produce_buffer.append((tp, offset, fut))
+
+                if offset_manager.should_commit():
+                    produce_buffer = free_queue_space(produce_buffer)
+                    offset_manager.maybe_commit()
+
+            if offset_manager.should_commit():
+                produce_buffer = free_queue_space(produce_buffer)
+                offset_manager.maybe_commit()
 
     except KeyboardInterrupt:
-        producer.close()
-        consumer.close(autocommit=False)
-    else:
-        producer.close()
-        consumer.close(autocommit=True)
+        pass
+
+    producer.flush()
+    for (tp, offset, fut) in produce_buffer:
+        fut.get()
+        offset_manager.report_consumed(tp, offset)
+    offset_manager.commit()
+
+    producer.close()
+    consumer.close(autocommit=False)
 
 
 main.add_command(fetch)
