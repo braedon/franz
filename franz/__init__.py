@@ -6,8 +6,10 @@ import sys
 import time
 
 from kafka import KafkaConsumer, KafkaProducer
-from kafka.structs import TopicPartition
 from kafka.partitioner.default import DefaultPartitioner
+from kafka.protocol.commit import GroupCoordinatorRequest, OffsetFetchRequest
+from kafka.protocol.metadata import MetadataRequest
+from kafka.structs import TopicPartition
 
 from .utils import OffsetManager, OffsetManagerRebalanceListener
 
@@ -38,7 +40,10 @@ def assign_consumer(topic_dict, consumer):
 
 def seek_consumer(topic_dict, consumer):
     for tp, (start, end) in topic_dict.items():
-        consumer.seek(tp, start)
+        if start == 0:
+            consumer.seek_to_beginning(tp)
+        else:
+            consumer.seek(tp, start)
 
 
 def slice_consumer(topic_dict, consumer):
@@ -125,21 +130,24 @@ def fetch(topic,
     )
     logging.captureWarnings(True)
 
+    bootstrap_brokers = bootstrap_brokers.split(',')
+
+    consumer = KafkaConsumer(
+        bootstrap_servers=bootstrap_brokers,
+        value_deserializer=value_deserializer,
+        key_deserializer=key_deserializer,
+        consumer_timeout_ms=fetch_timeout * 1000,
+    )
+
+    client = consumer._client
+
+    node = client.least_loaded_node()
+
     topic_dict = {}
 
     for t in topic:
-        # TODO: how to find this per topic...
-        all_partitions = list(range(24))
-
-        if filter_keys:
-            partitioner = DefaultPartitioner()
-            filter_key_partitions = {partitioner(key_serializer(k), all_partitions, all_partitions)
-                                     for k in filter_keys}
-            all_partitions = [p for p in all_partitions if p in filter_key_partitions]
-
         # TODO: Parse topic spec properly and provide better error messages.
-
-        match = re.search(r'^([^\[\]]+)(\[([\d,:=+]+)\])?$', t)
+        match = re.search(r'^([^\[\]]+)(\[([a-zA-Z-_.\d,:=+]+)\])?$', t)
         if not match:
             logging.error('Topic argument "{}" is invalid.'.format(t))
             exit(1)
@@ -147,6 +155,21 @@ def fetch(topic,
         topic, _, slice_spec = match.groups()
 
         # TODO: Fetch current earliest/latest offsets and use to support relative slices
+
+        request = MetadataRequest[0](topics=[topic])
+        f = client.send(node, request)
+        client.poll(future=f)
+        if f.failed():
+            raise f.exception
+        TOPIC_PARTITIONS = 2
+        PARTITION_NUMBER = 1
+        all_partitions = sorted(p[PARTITION_NUMBER] for p in f.value.topics[0][TOPIC_PARTITIONS])
+
+        if filter_keys:
+            partitioner = DefaultPartitioner()
+            filter_key_partitions = {partitioner(key_serializer(k), all_partitions, all_partitions)
+                                     for k in filter_keys}
+            all_partitions = [p for p in all_partitions if p in filter_key_partitions]
 
         slices = slice_spec.split(',')
         for s in slices:
@@ -170,36 +193,107 @@ def fetch(topic,
             else:
                 partitions = all_partitions
 
-            if ':' in s:
-                start, end = s.split(':', 1)
-
-                if start == '':
-                    start = 0
-                else:
-                    start = int(start)
-
-                if end == '':
-                    end = None
-                elif end[0] == '+':
-                    end = start + int(end[1:])
-                else:
-                    end = int(end)
-            else:
-                start = int(s)
-                end = start + 1
+            # TODO: Deal with consumer group start/ends properly...
+            consumer_group_offsets = {}
 
             for partition in partitions:
+                if ':' in s:
+                    start, end = s.split(':', 1)
+
+                    if start == '':
+                        start = 0
+                    elif start.isdecimal():
+                        start = int(start)
+                    else:
+
+                        if start not in consumer_group_offsets:
+                            request = GroupCoordinatorRequest[0](consumer_group=start)
+                            f = client.send(node, request)
+                            client.poll(future=f)
+                            if f.failed():
+                                raise f.exception
+                            coordinator_node = f.value.coordinator_id
+
+                            request = OffsetFetchRequest[1](consumer_group=start, topics=[(topic, partitions)])
+                            f = client.send(coordinator_node, request)
+                            client.poll(future=f)
+                            if f.failed():
+                                raise f.exception
+                            consumer_group_offsets[start] = f.value
+
+                        TOPIC_PARTITIONS = 1
+                        PARTITION_NUMBER = 0
+                        PARTITION_OFFSET = 1
+                        for p in consumer_group_offsets[start].topics[0][TOPIC_PARTITIONS]:
+                            if p[PARTITION_NUMBER] == partition:
+                                start = p[PARTITION_OFFSET]
+                                break
+
+                    if end == '':
+                        end = None
+                    elif end[0] == '+':
+                        end = start + int(end[1:])
+                    elif end.isdecimal():
+                        end = int(end)
+                    else:
+
+                        if end not in consumer_group_offsets:
+                            request = GroupCoordinatorRequest[0](consumer_group=end)
+                            f = client.send(node, request)
+                            client.poll(future=f)
+                            if f.failed():
+                                raise f.exception
+                            coordinator_node = f.value.coordinator_id
+
+                            request = OffsetFetchRequest[1](consumer_group=end, topics=[(topic, partitions)])
+                            f = client.send(coordinator_node, request)
+                            client.poll(future=f)
+                            if f.failed():
+                                raise f.exception
+                            consumer_group_offsets[end] = f.value
+
+                        TOPIC_PARTITIONS = 1
+                        PARTITION_NUMBER = 0
+                        PARTITION_OFFSET = 1
+                        for p in consumer_group_offsets[end].topics[0][TOPIC_PARTITIONS]:
+                            if p[PARTITION_NUMBER] == partition:
+                                # TODO: Should this be offset + 1?
+                                end = p[PARTITION_OFFSET]
+                                break
+
+                elif s.isdecimal():
+                    start = int(s)
+                    end = start + 1
+                else:
+
+                    if s not in consumer_group_offsets:
+                        request = GroupCoordinatorRequest[0](consumer_group=s)
+                        f = client.send(node, request)
+                        client.poll(future=f)
+                        if f.failed():
+                            raise f.exception
+                        coordinator_node = f.value.coordinator_id
+
+                        request = OffsetFetchRequest[1](consumer_group=s, topics=[(topic, partitions)])
+                        f = client.send(coordinator_node, request)
+                        client.poll(future=f)
+                        if f.failed():
+                            raise f.exception
+                        consumer_group_offsets[s] = f.value
+
+                    TOPIC_PARTITIONS = 1
+                    PARTITION_NUMBER = 0
+                    PARTITION_OFFSET = 1
+                    for p in consumer_group_offsets[s].topics[0][TOPIC_PARTITIONS]:
+                        if p[PARTITION_NUMBER] == partition:
+                            # TODO: Should this read the latest consumed message, or
+                            #       the next to be consumed?
+                            start = p[PARTITION_OFFSET]
+                            end = start + 1
+                            break
+
                 tp = TopicPartition(topic, partition)
                 topic_dict[tp] = (start, end)
-
-    bootstrap_brokers = bootstrap_brokers.split(',')
-
-    consumer = KafkaConsumer(
-        bootstrap_servers=bootstrap_brokers,
-        value_deserializer=value_deserializer,
-        key_deserializer=key_deserializer,
-        consumer_timeout_ms=fetch_timeout * 1000,
-    )
 
     message_count = 0
     try:
