@@ -423,6 +423,12 @@ def seek(consumer_group,
         for tp, offset in topic_dict.items():
             consumer.seek(tp, offset)
 
+        current_offsets = {}
+        for tp in topic_dict:
+            if tp.topic not in current_offsets:
+                current_offsets[tp.topic] = {}
+            current_offsets[tp.topic][tp.partition] = consumer.position(tp)
+
         for topic, partition_offsets in current_offsets.items():
             print('After: {}[{}]'.format(topic, ','.join('{}={}'.format(p, o) for p, o in partition_offsets.items())))
 
