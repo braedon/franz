@@ -353,6 +353,66 @@ def fetch(topic,
                    ' e.g. broker1:9999. (default: localhost)')
 @click.option('-v', '--verbose', is_flag=True,
               help='Turn on verbose logging.')
+def position(consumer_group,
+             topic,
+             bootstrap_brokers,
+             verbose):
+    '''Seek a consumer group to a location in one or more topic partitions.
+       By default, connect to a kafka cluster at localhost:9092.'''
+
+    logging.basicConfig(
+        format='[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s',
+        level=logging.DEBUG if verbose else logging.INFO
+    )
+    logging.captureWarnings(True)
+
+    topic_partitons = []
+
+    for t in topic:
+        # TODO: how to find this per topic...
+        all_partitions = range(24)
+
+        for partition in all_partitions:
+            tp = TopicPartition(t, partition)
+            topic_partitons.append(tp)
+
+    if topic_partitons:
+
+        bootstrap_brokers = bootstrap_brokers.split(',')
+
+        consumer = KafkaConsumer(
+            bootstrap_servers=bootstrap_brokers,
+            value_deserializer=value_deserializer,
+            key_deserializer=key_deserializer,
+            group_id=consumer_group,
+            enable_auto_commit=False,
+        )
+
+        consumer.assign(topic_partitons)
+
+        current_offsets = {}
+        for tp in topic_partitons:
+            if tp.topic not in current_offsets:
+                current_offsets[tp.topic] = {}
+            current_offsets[tp.topic][tp.partition] = consumer.position(tp)
+
+        for topic, partition_offsets in current_offsets.items():
+            print('Position: {}[{}]'.format(topic, ','.join('{}={}'.format(p, o) for p, o in partition_offsets.items())))
+
+        consumer.close()
+
+
+@click.command()
+@click.argument('consumer_group')
+@click.argument('topic', nargs=-1)
+@click.option('-b', '--bootstrap-brokers', default='localhost',
+              help='Addresses of brokers in a Kafka cluster to talk to.' +
+                   ' Brokers should be separated by commas' +
+                   ' e.g. broker1,broker2.' +
+                   ' Ports can be provided if non-standard (9092)' +
+                   ' e.g. broker1:9999. (default: localhost)')
+@click.option('-v', '--verbose', is_flag=True,
+              help='Turn on verbose logging.')
 def seek(consumer_group,
          topic,
          bootstrap_brokers,
@@ -776,6 +836,7 @@ def pipe(source_topic,
 
 
 main.add_command(fetch)
+main.add_command(position)
 main.add_command(seek)
 main.add_command(consume)
 main.add_command(produce)
