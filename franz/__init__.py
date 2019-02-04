@@ -4,11 +4,13 @@ import logging
 import re
 import sys
 import time
+import rfc3339
 
 from kafka import KafkaConsumer, KafkaProducer
 from kafka.partitioner.default import DefaultPartitioner
 from kafka.protocol.commit import GroupCoordinatorRequest, OffsetFetchRequest
 from kafka.protocol.metadata import MetadataRequest
+from kafka.protocol.offset import OffsetRequest, OffsetResetStrategy
 from kafka.structs import TopicPartition
 
 from .utils import OffsetManager, OffsetManagerRebalanceListener
@@ -90,6 +92,106 @@ def main():
 
 
 @click.command()
+@click.argument('when')
+@click.argument('topic', nargs=-1)
+@click.option('-b', '--bootstrap-brokers', default='localhost',
+              help='Addresses of brokers in a Kafka cluster to talk to.' +
+                   ' Brokers should be separated by commas' +
+                   ' e.g. broker1,broker2.' +
+                   ' Ports can be provided if non-standard (9092)' +
+                   ' e.g. broker1:9999. (default: localhost)')
+@click.option('-v', '--verbose', is_flag=True,
+              help='Turn on verbose logging.')
+def watermark(when,
+              topic,
+              bootstrap_brokers,
+              verbose):
+    '''Find the watermark of a topic, at a particular time.
+       By default, connect to a kafka cluster at localhost:9092.'''
+
+    logging.basicConfig(
+        format='[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s',
+        level=logging.DEBUG if verbose else logging.WARNING
+    )
+    logging.captureWarnings(True)
+
+    if when.lower() == 'earliest':
+        when = OffsetResetStrategy.EARLIEST
+    elif when.lower() == 'latest':
+        when = OffsetResetStrategy.LATEST
+    else:
+        when = rfc3339.parse_datetime(when)
+        when = int(when.timestamp() * 1000)
+
+    bootstrap_brokers = bootstrap_brokers.split(',')
+
+    consumer = KafkaConsumer(
+        bootstrap_servers=bootstrap_brokers,
+        value_deserializer=value_deserializer,
+        key_deserializer=key_deserializer,
+    )
+
+    client = consumer._client
+
+    node = client.least_loaded_node()
+
+    request = MetadataRequest[1](topic)
+    f = client.send(node, request)
+    client.poll(future=f)
+    if f.failed():
+        raise f.exception
+    metadata_topics = f.value.topics
+
+    nodes_map = {}
+    for t in metadata_topics:
+        topic = t[1]
+        partitions = t[3]
+        for p in partitions:
+            partition = p[1]
+            leader = p[2]
+            if leader not in nodes_map:
+                nodes_map[leader] = {}
+            if topic not in nodes_map[leader]:
+                nodes_map[leader][topic] = []
+            nodes_map[leader][topic].append(partition)
+
+    current_offsets = {}
+    for node, topic_map in nodes_map.items():
+
+        request = OffsetRequest[1](
+            -1,
+            [(topic,
+              [(partition, when)
+               for partition in partitions])
+             for topic, partitions in topic_map.items()]
+        )
+        # Seem to need to poll to allow connections to
+        # nodes to complete.
+        while not client.ready(node):
+            client.poll()
+            time.sleep(0.1)
+        f = client.send(node, request)
+        client.poll(future=f)
+        if f.failed():
+            raise f.exception
+
+        for t in f.value.topics:
+            topic = t[0]
+            if topic not in current_offsets:
+                current_offsets[topic] = {}
+            partitions = t[1]
+            for p in partitions:
+                partition = p[0]
+                offset = p[3]
+                current_offsets[topic][partition] = offset
+
+    for topic, partition_offsets in current_offsets.items():
+        print('Position: {}[{}]'.format(topic, ','.join('{}={}'.format(p, o) for p, o in sorted(partition_offsets.items()))))
+
+    consumer.close()
+
+
+@click.command()
 @click.argument('topic', nargs=-1)
 @click.option('-b', '--bootstrap-brokers', default='localhost',
               help='Addresses of brokers in a Kafka cluster to talk to.' +
@@ -126,7 +228,7 @@ def fetch(topic,
 
     logging.basicConfig(
         format='[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s',
-        level=logging.DEBUG if verbose else logging.INFO
+        level=logging.DEBUG if verbose else logging.WARNING
     )
     logging.captureWarnings(True)
 
@@ -362,7 +464,7 @@ def position(consumer_group,
 
     logging.basicConfig(
         format='[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s',
-        level=logging.DEBUG if verbose else logging.INFO
+        level=logging.DEBUG if verbose else logging.WARNING
     )
     logging.captureWarnings(True)
 
@@ -397,7 +499,7 @@ def position(consumer_group,
             current_offsets[tp.topic][tp.partition] = consumer.position(tp)
 
         for topic, partition_offsets in current_offsets.items():
-            print('Position: {}[{}]'.format(topic, ','.join('{}={}'.format(p, o) for p, o in partition_offsets.items())))
+            print('Position: {}[{}]'.format(topic, ','.join('{}={}'.format(p, o) for p, o in sorted(partition_offsets.items()))))
 
         consumer.close()
 
@@ -422,7 +524,7 @@ def seek(consumer_group,
 
     logging.basicConfig(
         format='[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s',
-        level=logging.DEBUG if verbose else logging.INFO
+        level=logging.DEBUG if verbose else logging.WARNING
     )
     logging.captureWarnings(True)
 
@@ -478,7 +580,7 @@ def seek(consumer_group,
             current_offsets[tp.topic][tp.partition] = consumer.position(tp)
 
         for topic, partition_offsets in current_offsets.items():
-            print('Before: {}[{}]'.format(topic, ','.join('{}={}'.format(p, o) for p, o in partition_offsets.items())))
+            print('Before: {}[{}]'.format(topic, ','.join('{}={}'.format(p, o) for p, o in sorted(partition_offsets.items()))))
 
         for tp, offset in topic_dict.items():
             consumer.seek(tp, offset)
@@ -490,7 +592,7 @@ def seek(consumer_group,
             current_offsets[tp.topic][tp.partition] = consumer.position(tp)
 
         for topic, partition_offsets in current_offsets.items():
-            print('After: {}[{}]'.format(topic, ','.join('{}={}'.format(p, o) for p, o in partition_offsets.items())))
+            print('After: {}[{}]'.format(topic, ','.join('{}={}'.format(p, o) for p, o in sorted(partition_offsets.items()))))
 
         consumer.commit()
 
@@ -537,7 +639,7 @@ def consume(topic,
 
     logging.basicConfig(
         format='[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s',
-        level=logging.DEBUG if verbose else logging.INFO
+        level=logging.DEBUG if verbose else logging.WARNING
     )
     logging.captureWarnings(True)
 
@@ -615,7 +717,7 @@ def produce(topic,
 
     logging.basicConfig(
         format='[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s',
-        level=logging.DEBUG if verbose else logging.INFO
+        level=logging.DEBUG if verbose else logging.WARNING
     )
     logging.captureWarnings(True)
 
@@ -737,7 +839,7 @@ def pipe(source_topic,
 
     logging.basicConfig(
         format='[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s',
-        level=logging.DEBUG if verbose else logging.INFO
+        level=logging.DEBUG if verbose else logging.WARNING
     )
     logging.captureWarnings(True)
 
@@ -835,6 +937,7 @@ def pipe(source_topic,
     consumer.close(autocommit=False)
 
 
+main.add_command(watermark)
 main.add_command(fetch)
 main.add_command(position)
 main.add_command(seek)
