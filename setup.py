@@ -24,6 +24,7 @@ setup(
         'crc32c',
         'kafka-python>=1.4.3',
         'python-snappy',
+        'tonyg-rfc3339',
     ],
     entry_points={
         'console_scripts': [
