@@ -592,7 +592,7 @@ def seek(consumer_group,
             current_offsets[tp.topic][tp.partition] = consumer.position(tp)
 
         for topic, partition_offsets in current_offsets.items():
-            print('After: {}[{}]'.format(topic, ','.join('{}={}'.format(p, o) for p, o in sorted(partition_offsets.items()))))
+            print('After:  {}[{}]'.format(topic, ','.join('{}={}'.format(p, o) for p, o in sorted(partition_offsets.items()))))
 
         consumer.commit()
 
@@ -652,7 +652,7 @@ def consume(topic,
         key_deserializer=key_deserializer,
         auto_offset_reset='earliest' if default_earliest_offset else 'latest',
         consumer_timeout_ms=fetch_timeout * 1000,
-        group_id=consumer_group
+        group_id=consumer_group,
     )
 
     try:
@@ -853,6 +853,7 @@ def pipe(source_topic,
         consumer_timeout_ms=min(fetch_timeout * 1000, 500),
         group_id=consumer_group,
         enable_auto_commit=False,
+        max_partition_fetch_bytes=32 * 1024 * 1024,  # 32MB, default 1MB
     )
 
     producer = KafkaProducer(
@@ -863,8 +864,8 @@ def pipe(source_topic,
         acks='all',
         compression_type=compression,
         # TODO: make these configurable?
-        linger_ms=100,
-        batch_size=262144,  # 256kB, default 32kB
+        linger_ms=200,
+        batch_size=512 * 1024,  # 512kB, default 16kB
     )
 
     commit_interval = consumer.config['auto_commit_interval_ms'] / 1000
@@ -873,7 +874,7 @@ def pipe(source_topic,
 
     consumer.subscribe(topics=[source_topic], listener=rebalance_listener)
 
-    produce_buffer_size = 500
+    produce_buffer_size = 10_000
 
     def free_queue_space(produce_buffer, ensure_space=False):
         if not produce_buffer:
