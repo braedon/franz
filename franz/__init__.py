@@ -486,11 +486,22 @@ def position(consumer_group,
     topic_partitons = []
 
     for t in topic:
-        # TODO: how to find this per topic...
-        all_partitions = range(24)
+        # TODO: Parse topic spec properly and provide better error messages.
+        match = re.search(r'^([^\[\]]+)(\[(\d+(,\d+)*)\])?$', t)
+        if not match:
+            logging.error('Topic argument "{}" is invalid.'.format(t))
+            exit(1)
 
-        for partition in all_partitions:
-            tp = TopicPartition(t, partition)
+        topic, _, partition_spec, _ = match.groups()
+
+        if partition_spec:
+            partitions = [int(p) for p in partition_spec.split(',')]
+        else:
+            # TODO: how to find this per topic...
+            partitions = range(12)
+
+        for partition in partitions:
+            tp = TopicPartition(topic, partition)
             topic_partitons.append(tp)
 
     if topic_partitons:
