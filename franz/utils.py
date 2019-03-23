@@ -17,10 +17,11 @@ class OffsetManager(object):
         self.to_commit[tp] = OffsetAndMetadata(offset + 1, '')
 
     def commit(self):
-        logging.debug('Committing offsets')
         this_commit = time.monotonic()
-        if self.consumer.config['group_id']:
+        if self.consumer.config['group_id'] and self.to_commit:
+            logging.info('Starting offset commit')
             self.consumer.commit(offsets=self.to_commit)
+            logging.info('Finished offset commit')
         self.last_commit = this_commit
         self.to_commit = {}
 
@@ -32,7 +33,7 @@ class OffsetManager(object):
             self.commit()
 
     def reset(self):
-        logging.debug('Resetting offset manager')
+        logging.info('Resetting offset manager')
         self.last_commit = time.monotonic()
         self.to_commit = {}
 

@@ -102,16 +102,21 @@ def main():
                    ' e.g. broker1:9999. (default: localhost)')
 @click.option('-v', '--verbose', is_flag=True,
               help='Turn on verbose logging.')
+@click.option('-vv', '--very-verbose', is_flag=True,
+              help='Turn on very verbose logging.')
 def watermark(when,
               topic,
               bootstrap_brokers,
-              verbose):
+              verbose,
+              very_verbose):
     '''Find the watermark of a topic, at a particular time.
        By default, connect to a kafka cluster at localhost:9092.'''
 
     logging.basicConfig(
         format='[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s',
-        level=logging.DEBUG if verbose else logging.WARNING
+        level=logging.DEBUG if very_verbose else
+               logging.INFO if verbose else
+               logging.WARNING
     )
     logging.captureWarnings(True)
 
@@ -213,13 +218,16 @@ def watermark(when,
                    ' [topic:partition:offset:key] value')
 @click.option('-v', '--verbose', is_flag=True,
               help='Turn on verbose logging.')
+@click.option('-vv', '--very-verbose', is_flag=True,
+              help='Turn on very verbose logging.')
 def fetch(topic,
           bootstrap_brokers,
           filter_key,
           fetch_timeout,
           json_value,
           readable,
-          verbose):
+          verbose,
+          very_verbose):
     '''Fetch a message, or messages, from a Kafka topic partition.
        By default, connect to a kafka cluster at localhost:9092 and fetch
        the message at the specified offset, outputting in JSON format.'''
@@ -228,7 +236,9 @@ def fetch(topic,
 
     logging.basicConfig(
         format='[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s',
-        level=logging.DEBUG if verbose else logging.WARNING
+        level=logging.DEBUG if very_verbose else
+               logging.INFO if verbose else
+               logging.WARNING
     )
     logging.captureWarnings(True)
 
@@ -455,16 +465,21 @@ def fetch(topic,
                    ' e.g. broker1:9999. (default: localhost)')
 @click.option('-v', '--verbose', is_flag=True,
               help='Turn on verbose logging.')
+@click.option('-vv', '--very-verbose', is_flag=True,
+              help='Turn on very verbose logging.')
 def position(consumer_group,
              topic,
              bootstrap_brokers,
-             verbose):
+             verbose,
+             very_verbose):
     '''Seek a consumer group to a location in one or more topic partitions.
        By default, connect to a kafka cluster at localhost:9092.'''
 
     logging.basicConfig(
         format='[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s',
-        level=logging.DEBUG if verbose else logging.WARNING
+        level=logging.DEBUG if very_verbose else
+               logging.INFO if verbose else
+               logging.WARNING
     )
     logging.captureWarnings(True)
 
@@ -515,16 +530,21 @@ def position(consumer_group,
                    ' e.g. broker1:9999. (default: localhost)')
 @click.option('-v', '--verbose', is_flag=True,
               help='Turn on verbose logging.')
+@click.option('-vv', '--very-verbose', is_flag=True,
+              help='Turn on very verbose logging.')
 def seek(consumer_group,
          topic,
          bootstrap_brokers,
-         verbose):
+         verbose,
+         very_verbose):
     '''Seek a consumer group to a location in one or more topic partitions.
        By default, connect to a kafka cluster at localhost:9092.'''
 
     logging.basicConfig(
         format='[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s',
-        level=logging.DEBUG if verbose else logging.WARNING
+        level=logging.DEBUG if very_verbose else
+               logging.INFO if verbose else
+               logging.WARNING
     )
     logging.captureWarnings(True)
 
@@ -625,6 +645,8 @@ def seek(consumer_group,
                    ' [topic:partition:offset:key] value')
 @click.option('-v', '--verbose', is_flag=True,
               help='Turn on verbose logging.')
+@click.option('-vv', '--very-verbose', is_flag=True,
+              help='Turn on very verbose logging.')
 def consume(topic,
             bootstrap_brokers,
             consumer_group,
@@ -632,14 +654,17 @@ def consume(topic,
             default_earliest_offset,
             json_value,
             readable,
-            verbose):
+            verbose,
+            very_verbose):
     '''Consume messages from a Kafka topic, or topics.
        By default, connect to a kafka cluster at localhost:9092 and consume new
        messages on the topic(s) indefinitely, outputting in JSON format.'''
 
     logging.basicConfig(
         format='[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s',
-        level=logging.DEBUG if verbose else logging.WARNING
+        level=logging.DEBUG if very_verbose else
+               logging.INFO if verbose else
+               logging.WARNING
     )
     logging.captureWarnings(True)
 
@@ -707,17 +732,22 @@ def consume(topic,
               help='Which compression to use when producing messages. (default: None)')
 @click.option('-v', '--verbose', is_flag=True,
               help='Turn on verbose logging.')
+@click.option('-vv', '--very-verbose', is_flag=True,
+              help='Turn on very verbose logging.')
 def produce(topic,
             bootstrap_brokers,
             json_value,
             compression,
-            verbose):
+            verbose,
+            very_verbose):
     '''Produce messages to a Kafka topic.
        By default, connect to a kafka cluster at localhost:9092.'''
 
     logging.basicConfig(
         format='[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s',
-        level=logging.DEBUG if verbose else logging.WARNING
+        level=logging.DEBUG if very_verbose else
+               logging.INFO if verbose else
+               logging.WARNING
     )
     logging.captureWarnings(True)
 
@@ -825,6 +855,8 @@ def produce(topic,
               help='Which compression to use when producing messages. (default: None)')
 @click.option('-v', '--verbose', is_flag=True,
               help='Turn on verbose logging.')
+@click.option('-vv', '--very-verbose', is_flag=True,
+              help='Turn on very verbose logging.')
 def pipe(source_topic,
          destination_topic,
          bootstrap_brokers,
@@ -832,14 +864,17 @@ def pipe(source_topic,
          fetch_timeout,
          default_earliest_offset,
          compression,
-         verbose):
+         verbose,
+         very_verbose):
     '''Consume messages from a Kafka topic, and produce to another Kafka topic.
        By default, connect to a kafka cluster at localhost:9092 and consume new
        messages on the source topic indefinitely, producing to the destination topic.'''
 
     logging.basicConfig(
         format='[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s',
-        level=logging.DEBUG if verbose else logging.WARNING
+        level=logging.DEBUG if very_verbose else
+               logging.INFO if verbose else
+               logging.WARNING
     )
     logging.captureWarnings(True)
 
@@ -890,12 +925,22 @@ def pipe(source_topic,
                 break
 
         # If the buffer was full, and we were supposed to clear some space,
-        # and we haven't, wait until we can clear the first slot.
+        # and we haven't, wait until we can clear at least the first slot.
         if len(produce_buffer) >= produce_buffer_size and ensure_space and not done:
-            tp, offset, fut = produce_buffer[0]
-            fut.get()
-            offset_manager.report_consumed(tp, offset)
-            done += 1
+            # TODO: How long should we wait? How do we set this?
+            wait_end_ms = time.monotonic() + 0.1
+            logging.info('Starting waiting for produce futures')
+            for tp, offset, fut in produce_buffer:
+                fut.get()
+                offset_manager.report_consumed(tp, offset)
+                done += 1
+
+                if time.monotonic() >= wait_end_ms:
+                    break
+
+            logging.info('Finished waiting for produce futures')
+
+        logging.info('Confirmed production of %(count)s messages', {'count': done})
 
         new_produce_buffer = produce_buffer[done:]
 
