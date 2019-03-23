@@ -22,7 +22,7 @@ setup(
     install_requires=[
         'click',
         'crc32c',
-        'kafka-python>=1.4.3',
+        'kafka-python==1.4.4',
         'python-snappy',
         'tonyg-rfc3339',
     ],
