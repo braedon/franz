@@ -9,7 +9,7 @@ class OffsetManager(object):
     def __init__(self, consumer, commit_interval):
         self.consumer = consumer
         self.commit_interval = commit_interval
-        self.has_group = False
+        self.has_group = bool(consumer.config['group_id'])
         self.to_commit = {}
         self.last_commit = time.monotonic()
 
@@ -18,7 +18,7 @@ class OffsetManager(object):
 
     def commit(self):
         this_commit = time.monotonic()
-        if self.consumer.config['group_id'] and self.to_commit:
+        if self.has_group and self.to_commit:
             logging.info('Starting offset commit')
             self.consumer.commit(offsets=self.to_commit)
             logging.info('Finished offset commit')
@@ -26,7 +26,7 @@ class OffsetManager(object):
         self.to_commit = {}
 
     def should_commit(self):
-        return (time.monotonic() - self.last_commit) > self.commit_interval
+        return self.has_group and (time.monotonic() - self.last_commit) > self.commit_interval
 
     def maybe_commit(self):
         if self.should_commit():

@@ -689,9 +689,12 @@ def consume(topic,
         auto_offset_reset='earliest' if default_earliest_offset else 'latest',
         consumer_timeout_ms=fetch_timeout * 1000,
         group_id=consumer_group,
+        max_partition_fetch_bytes=32 * 1024 * 1024,  # 32MB, default 1MB
     )
 
     try:
+        start_s = time.monotonic()
+        count = 0
         for message in consumer:
             value = message.value
             value_string = value
@@ -721,7 +724,16 @@ def consume(topic,
                 json.dump(output, sys.stdout, separators=(',', ':'))
                 sys.stdout.write('\n')
 
-            sys.stdout.flush()
+            count += 1
+
+            now_s = time.monotonic()
+            duration_s = now_s - start_s
+            if duration_s > 5 and count:
+                sys.stdout.flush()
+                logging.info('Consumed %(count)s messages in %(duration_s)ss, %(rate)s/s',
+                             {'count': count, 'duration_s': duration_s, 'rate': count / duration_s})
+                count = 0
+                start_s = now_s
 
     except KeyboardInterrupt:
         pass
@@ -741,6 +753,8 @@ def consume(topic,
               help='Parse message values as JSON.')
 @click.option('-c', '--compression', type=click.Choice(['snappy']),
               help='Which compression to use when producing messages. (default: None)')
+@click.option('--produce-buffer-length', type=int, default=1000,
+              help='Max messages to buffer waiting for acks from the brokers. (default=1000)')
 @click.option('-v', '--verbose', is_flag=True,
               help='Turn on verbose logging.')
 @click.option('-vv', '--very-verbose', is_flag=True,
@@ -749,6 +763,7 @@ def produce(topic,
             bootstrap_brokers,
             json_value,
             compression,
+            produce_buffer_length,
             verbose,
             very_verbose):
     '''Produce messages to a Kafka topic.
@@ -772,18 +787,16 @@ def produce(topic,
         acks='all',
         compression_type=compression,
         # TODO: make these configurable?
-        linger_ms=100,
-        batch_size=131072,  # 128kB, default 32kB
+        linger_ms=200,
+        batch_size=512 * 1024,  # 512kB, default 16kB
     )
-
-    produce_buffer_size = 500
 
     def free_queue_space(produce_buffer, ensure_space=False):
         if not produce_buffer:
             return produce_buffer
 
         done = 0
-        for (tp, offset, fut) in produce_buffer:
+        for fut in produce_buffer:
             if fut.is_done:
                 fut.get()
                 done += 1
@@ -792,10 +805,23 @@ def produce(topic,
 
         # If the buffer was full, and we were supposed to clear some space,
         # and we haven't, wait until we can clear the first slot.
-        if len(produce_buffer) >= produce_buffer_size and ensure_space and not done:
-            tp, offset, fut = produce_buffer[0]
-            fut.get()
-            done += 1
+        if len(produce_buffer) >= produce_buffer_length and ensure_space and not done:
+            # TODO: How long should we wait? How do we set this?
+            wait_end_s = time.monotonic() + 0.1
+            logging.info('Starting waiting for produce futures')
+            for fut in produce_buffer:
+                fut.get()
+                done += 1
+
+                if time.monotonic() >= wait_end_s:
+                    break
+
+            logging.info('Finished waiting for produce futures')
+
+        if not done:
+            return produce_buffer
+
+        logging.info('Confirmed production of %(count)s messages', {'count': done})
 
         new_produce_buffer = produce_buffer[done:]
 
@@ -806,7 +832,7 @@ def produce(topic,
     try:
         for line in sys.stdin:
 
-            if len(produce_buffer) >= produce_buffer_size:
+            if len(produce_buffer) >= produce_buffer_length:
                 produce_buffer = free_queue_space(produce_buffer, ensure_space=True)
 
             message = json.loads(line)
@@ -830,14 +856,18 @@ def produce(topic,
             if 'partition' in message:
                 args['partition'] = message['partition']
 
-            producer.send(**args)
+            fut = producer.send(**args)
+            produce_buffer.append(fut)
 
     except KeyboardInterrupt:
         pass
 
     producer.flush()
-    for (tp, offset, fut) in produce_buffer:
-        fut.get()
+    if produce_buffer:
+        for fut in produce_buffer:
+            fut.get()
+        logging.info('Confirmed production of %(count)s messages',
+                     {'count': len(produce_buffer)})
 
     producer.close()
 
@@ -864,6 +894,8 @@ def produce(topic,
                    ' no committed offset is available.')
 @click.option('-c', '--compression', type=click.Choice(['snappy']),
               help='Which compression to use when producing messages. (default: None)')
+@click.option('--produce-buffer-length', type=int, default=1000,
+              help='Max messages to buffer waiting for acks from the brokers. (default=1000)')
 @click.option('-v', '--verbose', is_flag=True,
               help='Turn on verbose logging.')
 @click.option('-vv', '--very-verbose', is_flag=True,
@@ -875,6 +907,7 @@ def pipe(source_topic,
          fetch_timeout,
          default_earliest_offset,
          compression,
+         produce_buffer_length,
          verbose,
          very_verbose):
     '''Consume messages from a Kafka topic, and produce to another Kafka topic.
@@ -920,8 +953,6 @@ def pipe(source_topic,
 
     consumer.subscribe(topics=[source_topic], listener=rebalance_listener)
 
-    produce_buffer_size = 10_000
-
     def free_queue_space(produce_buffer, ensure_space=False):
         if not produce_buffer:
             return produce_buffer
@@ -937,19 +968,22 @@ def pipe(source_topic,
 
         # If the buffer was full, and we were supposed to clear some space,
         # and we haven't, wait until we can clear at least the first slot.
-        if len(produce_buffer) >= produce_buffer_size and ensure_space and not done:
+        if len(produce_buffer) >= produce_buffer_length and ensure_space and not done:
             # TODO: How long should we wait? How do we set this?
-            wait_end_ms = time.monotonic() + 0.1
+            wait_end_s = time.monotonic() + 0.1
             logging.info('Starting waiting for produce futures')
             for tp, offset, fut in produce_buffer:
                 fut.get()
                 offset_manager.report_consumed(tp, offset)
                 done += 1
 
-                if time.monotonic() >= wait_end_ms:
+                if time.monotonic() >= wait_end_s:
                     break
 
             logging.info('Finished waiting for produce futures')
+
+        if not done:
+            return produce_buffer
 
         logging.info('Confirmed production of %(count)s messages', {'count': done})
 
@@ -964,7 +998,7 @@ def pipe(source_topic,
             for m in consumer:
                 last_message_time = time.monotonic()
 
-                if len(produce_buffer) >= produce_buffer_size:
+                if len(produce_buffer) >= produce_buffer_length:
                     produce_buffer = free_queue_space(produce_buffer, ensure_space=True)
 
                 tp = TopicPartition(m.topic, m.partition)
@@ -985,10 +1019,13 @@ def pipe(source_topic,
         pass
 
     producer.flush()
-    for (tp, offset, fut) in produce_buffer:
-        fut.get()
-        offset_manager.report_consumed(tp, offset)
-    offset_manager.commit()
+    if produce_buffer:
+        for (tp, offset, fut) in produce_buffer:
+            fut.get()
+            offset_manager.report_consumed(tp, offset)
+        logging.info('Confirmed production of %(count)s messages',
+                     {'count': len(produce_buffer)})
+        offset_manager.commit()
 
     producer.close()
     consumer.close(autocommit=False)
