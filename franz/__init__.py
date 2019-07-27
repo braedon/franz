@@ -7,11 +7,13 @@ import time
 import rfc3339
 
 from kafka import KafkaConsumer, KafkaProducer
+from kafka.client_async import KafkaClient
 from kafka.partitioner.default import DefaultPartitioner
 from kafka.protocol.commit import GroupCoordinatorRequest, OffsetFetchRequest
 from kafka.protocol.metadata import MetadataRequest
 from kafka.protocol.offset import OffsetRequest, OffsetResetStrategy
 from kafka.structs import TopicPartition
+from math import floor
 
 from .utils import OffsetManager, OffsetManagerRebalanceListener
 
@@ -81,6 +83,15 @@ def slice_consumer(topic_dict, consumer):
             return
 
 
+def ensure_node_connected(client, node):
+    node_connected = client.is_ready(node)
+    if not node_connected:
+        while not node_connected:
+            client.maybe_connect(node, wakeup=False)
+            client.poll(timeout_ms=100)
+            node_connected = client.is_ready(node)
+
+
 CONTEXT_SETTINGS = {
     'help_option_names': ['-h', '--help']
 }
@@ -89,6 +100,416 @@ CONTEXT_SETTINGS = {
 @click.group(context_settings=CONTEXT_SETTINGS)
 def main():
     pass
+
+
+@click.command()
+@click.argument('topic', nargs=-1)
+@click.option('-b', '--bootstrap-brokers', default='localhost',
+              help='Addresses of brokers in a Kafka cluster to talk to.' +
+                   ' Brokers should be separated by commas' +
+                   ' e.g. broker1,broker2.' +
+                   ' Ports can be provided if non-standard (9092)' +
+                   ' e.g. broker1:9999. (default: localhost)')
+@click.option('-v', '--verbose', is_flag=True,
+              help='Turn on verbose logging.')
+@click.option('-vv', '--very-verbose', is_flag=True,
+              help='Turn on very verbose logging.')
+def metadata(topic,
+             bootstrap_brokers,
+             verbose,
+             very_verbose):
+    '''Fetch the metadata for one or more topics, or all topics if none are provided.
+       By default, connect to a kafka cluster at localhost:9092.'''
+
+    logging.basicConfig(
+        format='[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s',
+        level=logging.DEBUG if very_verbose else
+               logging.INFO if verbose else
+               logging.WARNING
+    )
+    logging.captureWarnings(True)
+
+    bootstrap_brokers = bootstrap_brokers.split(',')
+
+    client = KafkaClient(
+        bootstrap_servers=bootstrap_brokers,
+        api_version=(1, 1, 1),
+    )
+
+    node = client.least_loaded_node()
+    ensure_node_connected(client, node)
+
+    # If no topics have been specified, pass None to request all topics.
+    # (passing an empty list would request no topics)
+    request = MetadataRequest[1](topic or None)
+    f = client.send(node, request)
+    client.poll(future=f)
+    if f.failed():
+        raise f.exception
+
+    metadata = f.value
+    metadata_json = {
+        'brokers': [
+            {
+                'node_id': b[0],
+                'host': b[1],
+                'port': b[2],
+                'rack': b[3],
+            }
+            for b in metadata.brokers
+        ],
+        'controller_id': metadata.controller_id,
+        'topics': [
+            {
+                'error_code': t[0],
+                'topic': t[1],
+                'is_internal': t[2],
+                'partitions': [
+                    {
+                        'error_code': p[0],
+                        'partition': p[1],
+                        'leader': p[2],
+                        'replicas': p[3],
+                        'isr': p[4],
+                    }
+                    for p in t[3]
+                ],
+            }
+            for t in metadata.topics
+        ],
+    }
+
+    error_count = 0
+    for t in metadata_json['topics']:
+        if t['error_code']:
+            logging.error('Got error code %(error_code)s for topic %(topic_name)s.',
+                          {'error_code': t['error_code'],
+                           'topic_name': t['topic']})
+            error_count += 1
+        for p in t['partitions']:
+            if p['error_code']:
+                logging.error('Got error code %(error_code)s for partition %(topic_name)s:%(partition_num)s.',
+                              {'error_code': p['error_code'],
+                               'topic_name': t['topic'],
+                               'partition_num': p['partition']})
+                error_count += 1
+    if error_count:
+        logging.error('Aborting due to %(error_count)s errors.',
+                      {'error_count': error_count})
+        return
+
+    # json.dump(metadata_json, sys.stdout, separators=(',', ':'))
+    # sys.stdout.write('\n')
+    # sys.stdout.flush()
+
+    # broker_assigned_partitions = {}
+
+    # def log_dir_assigner(broker):
+    #     if broker not in (0,):
+    #         return 'any'
+
+    #     if broker in broker_assigned_partitions:
+    #         curr_assigned_partitions = broker_assigned_partitions[broker]
+    #     else:
+    #         curr_assigned_partitions = 0
+
+    #     log_dir_num = curr_assigned_partitions % 3
+
+    #     broker_assigned_partitions[broker] = curr_assigned_partitions + 1
+
+    #     return f'/kafka-logs-{log_dir_num}'
+
+    # assignment_json = {
+    #     'version': 1,
+    #     'partitions': [
+    #         {
+    #             'topic': t['topic'],
+    #             'partition': p['partition'],
+    #             'replicas': p['replicas'],
+    #             'log_dirs': [
+    #                 log_dir_assigner(r)
+    #                 for r in p['replicas']
+    #             ]
+    #         }
+    #         for t in metadata_json['topics']
+    #         for p in t['partitions']
+    #     ],
+    # }
+    # json.dump(assignment_json, sys.stdout, separators=(',', ':'))
+    # sys.stdout.write('\n')
+    # sys.stdout.flush()
+
+    # broker_move_map = {
+    #     6: 0,
+    #     7: 1,
+    #     8: 2,
+    # }
+
+    # assignment_jsons = [
+    #     {
+    #         'version': 1,
+    #         'partitions': [
+    #             {
+    #                 'topic': t['topic'],
+    #                 'partition': p['partition'],
+    #                 'replicas': [
+    #                     broker_move_map[r] if r in broker_move_map else r
+    #                     for r in p['replicas']
+    #                 ]
+    #             }
+    #             for t in metadata_json['topics']
+    #             if any(r in broker_move_map for p in t['partitions'] for r in p['replicas'])
+    #             if t['topic'] != '__consumer_offsets'
+    #             for p in t['partitions']
+    #         ]
+    #     }
+    # ]
+
+    # for assignment_json in assignment_jsons:
+    #     json.dump(assignment_json, sys.stdout, separators=(',', ':'))
+    #     sys.stdout.write('\n')
+    #     sys.stdout.flush()
+
+    old_topic_partition_broker_map = {
+        t['topic']: {
+            p['partition']: p['replicas']
+            for p in t['partitions']
+        }
+        for t in metadata_json['topics']
+        if not t['is_internal']
+    }
+
+    target_brokers = [0, 1, 2, 3, 4, 5]
+    # target_brokers = [3, 4, 5, 6, 7, 8]
+    # target_brokers = [0, 1, 2]
+
+    new_topic_partition_broker_map = {}
+    for t in sorted(metadata_json['topics'], key=lambda t: t['topic']):
+        topic_name = t['topic']
+        if t['is_internal']:
+            logging.info('Skipping internal topic %(topic_name)s',
+                         {'topic_name': topic_name})
+            continue
+
+        broker_count = len(target_brokers)
+        partition_replica_count = sum(len(p['replicas']) for p in t['partitions'])
+        # The base number of partitions each broker should have if
+        # evenly assigned.
+        optimum_partitions_per_broker = floor(partition_replica_count / broker_count)
+        # The number of partitions left over after even assignment.
+        # i.e. the number of brokers that will need to have an extra
+        # partition assigned.
+        overflow_partitions = partition_replica_count % broker_count
+
+        # A map from broker to assigned partitions.
+        # Filled in as partitions are assigned, allowing us to assign
+        # partitions to underutilised brokers.
+        # Note that each partition can be assigned to multiple brokers,
+        # as partitions (usually) have multiple replicas.
+        broker_partition_map = {b: [] for b in target_brokers}
+        # The number of brokers that have had an extra partition assigned
+        # so far. Must be kept less than or equal to `overflow_partitions`
+        # to avoid uneven assignment.
+        # Updated as partitions are assigned to brokers.
+        overflowed_brokers = 0
+        # The partitions we want to move to a new broker (as the old
+        # broker is not in `target_brokers`).
+        # Note that a partition may be listed multiple times, as a
+        # partition may have multiple replicas that need to be moved.
+        partitions_to_move = []
+        for p in sorted(t['partitions'], key=lambda p: p['partition']):
+            partition_num = p['partition']
+
+            # If a partition is currently assigned to a broker in
+            # `target_brokers`, leave it there to minimise movement.
+            # Otherwise, we want to move it.
+            for broker_num in sorted(p['replicas']):
+                if broker_num in target_brokers:
+                    broker_partitions = broker_partition_map[broker_num]
+                    # If the broker hasn't hit `optimum_partitions_per_broker`
+                    # yet, we can safely assign the partition.
+                    if len(broker_partitions) < optimum_partitions_per_broker:
+                        broker_partition_map[broker_num].append(partition_num)
+                    # If `optimum_partitions_per_broker` has been hit, but
+                    # there are `overflow_partitions` and we haven't assigned
+                    # them all yet, we can still assign the partition.
+                    elif (len(broker_partitions) == optimum_partitions_per_broker and
+                          overflowed_brokers < overflow_partitions):
+                        broker_partition_map[broker_num].append(partition_num)
+                        overflowed_brokers += 1
+                    # Otherwise, assigning the partition would cause a partition
+                    # imbalance - we'll have to move it.
+                    else:
+                        logging.warning('Moving partition %(topic_name)s:%(partition_num)s'
+                                        ' off broker %(broker_num)s to preserve balance.',
+                                        {'topic_name': topic_name,
+                                         'partition_num': partition_num,
+                                         'broker_num': broker_num})
+                        partitions_to_move.append(partition_num)
+
+                else:
+                    partitions_to_move.append(partition_num)
+
+        # For each partition we want to move, find the broker in
+        # `target_brokers` (that doesn't already have a replica of this
+        # partition assigned) with the least currently assigned partitions,
+        # and assign it there. Where multiple brokers have the same number
+        # of assigned partitions, pick the broker with the smallest
+        # `broker_num`.
+        for partition_num in partitions_to_move:
+            possible_brokers = [b for b in target_brokers
+                                if partition_num not in broker_partition_map[b]]
+            broker_num = min(possible_brokers, key=lambda b: (len(broker_partition_map[b]), b))
+
+            broker_partitions = broker_partition_map[broker_num]
+            # If the broker hasn't hit `optimum_partitions_per_broker`
+            # yet, we can safely assign the partition.
+            if len(broker_partitions) < optimum_partitions_per_broker:
+                pass
+            # If `optimum_partitions_per_broker` has been hit, but
+            # there are `overflow_partitions` and we haven't assigned
+            # them all yet, we can still assign the partition.
+            elif (len(broker_partitions) == optimum_partitions_per_broker and
+                  overflowed_brokers < overflow_partitions):
+                overflowed_brokers += 1
+            # Otherwise, assigning the partition would cause a partition
+            # imbalance - we have to do it, but warn.
+            else:
+                logging.warning('Assigning partition %(topic_name)s:%(partition_num)s'
+                                ' to broker %(broker_num)s despite imbalance.',
+                                {'topic_name': topic_name,
+                                 'partition_num': partition_num,
+                                 'broker_num': broker_num})
+
+            broker_partition_map[broker_num].append(partition_num)
+
+        # A map from partition to list of brokers the partition's
+        # replicas are assigned to. The order of brokers is not
+        # significant, as leadership has not yet been assigned.
+        raw_partition_broker_map = {p['partition']: [] for p in t['partitions']}
+        for broker_num, partitions in broker_partition_map.items():
+            for partition_num in partitions:
+                raw_partition_broker_map[partition_num].append(broker_num)
+
+        def rotate(l, start_item):
+            '''
+            Rotate list `l` such that `start_item` is at the start.
+            '''
+            n = l.index(start_item)
+            return l[n:] + l[:n]
+
+        # A map from partition to list of brokers the partition's
+        # replicas are assigned to. The first broker in the list
+        # will be the preferred leader.
+        # Filled in as we assign leaders.
+        partition_broker_map = {}
+        # The base order of brokers we want to maintain in the
+        # replica lists.
+        # Will be rotated based on the leader for each partition.
+        broker_order = sorted(target_brokers)
+        # A map from broker to the count of partitions it leads.
+        # Filled in as we assign leaders.
+        broker_partition_leader_counts = {b: 0 for b in target_brokers}
+        # The partitions we still need to find a leader for.
+        # Partitions are removed as we assign a leader to each.
+        # Used to help track how many possible partitions a broker
+        # could still lead.
+        partitions_needing_leader = set(raw_partition_broker_map.keys())
+        # For each partition, find the broker with a replica for this
+        # partition that is currently leading the least partitions,
+        # and use it as the leader.
+        # Where multiple brokers are leading the same number of partitions,
+        # pick the broker with the smallest number of possible partitions
+        # it could still lead (i.e. partitions it has a replica for that
+        # don't currently have a leader) - helps avoid starvation when a
+        # broker leads less partitions than the others, but doesn't have a
+        # replica for any remaining partition.
+        # Where multiple brokers have the same number of possible partitions
+        # remaining, pick the broker with the smallest `broker_num`.
+        for partition_num in sorted(raw_partition_broker_map.keys()):
+            partition_brokers = raw_partition_broker_map[partition_num]
+            lead_broker_num = min(partition_brokers,
+                                  key=lambda b: (
+                                      broker_partition_leader_counts[b],
+                                      sum(1 for p in broker_partition_map[b]
+                                          if p in partitions_needing_leader),
+                                      b
+                                  ))
+            partition_broker_map[partition_num] = [b for b in rotate(broker_order, lead_broker_num)
+                                                   if b in partition_brokers]
+            broker_partition_leader_counts[lead_broker_num] += 1
+            partitions_needing_leader.remove(partition_num)
+
+        if len(set(broker_partition_leader_counts.values())) > 1:
+            logging.warning('Uneven leader assignment for topic %(topic_name)s. %(partition_leader_counts)s',
+                            {'topic_name': topic_name,
+                             'partition_leader_counts': broker_partition_leader_counts})
+
+        new_topic_partition_broker_map[topic_name] = partition_broker_map
+
+    changed_topic_partition_broker_map = {}
+    for topic_name in old_topic_partition_broker_map.keys():
+
+        changed_partition_broker_map = {}
+        for partition_num in old_topic_partition_broker_map[topic_name].keys():
+            old_brokers = old_topic_partition_broker_map[topic_name][partition_num]
+            new_brokers = new_topic_partition_broker_map[topic_name][partition_num]
+            if frozenset(old_brokers) != frozenset(new_brokers):
+                logging.info('Changing replica assignment for partition %(topic_name)s:%(partition_num)s'
+                             ' from %(old_brokers)s to %(new_brokers)s',
+                             {'topic_name': topic_name,
+                              'partition_num': partition_num,
+                              'old_brokers': old_brokers,
+                              'new_brokers': new_brokers})
+                changed_partition_broker_map[partition_num] = new_brokers
+            elif old_brokers[0] != new_brokers[0]:
+                logging.info('Changing leader broker for partition %(topic_name)s:%(partition_num)s'
+                             ' from %(old_leader)s to %(new_leader)s',
+                             {'topic_name': topic_name,
+                              'partition_num': partition_num,
+                              'old_leader': old_brokers[0],
+                              'new_leader': new_brokers[0]})
+                changed_partition_broker_map[partition_num] = new_brokers
+            elif old_brokers != new_brokers:
+                # Order of brokers in replica list. Not meaningful enough
+                # change to log, but include in the changed map none the
+                # less, as we want to apply it to Kafka.
+                changed_partition_broker_map[partition_num] = new_brokers
+
+        if changed_partition_broker_map:
+            changed_topic_partition_broker_map[topic_name] = changed_partition_broker_map
+
+    broker_partition_leader_counts = {b: 0 for b in target_brokers}
+    broker_partition_counts = {b: 0 for b in target_brokers}
+    for topic_name, partition_broker_map in new_topic_partition_broker_map.items():
+        for partition_num, brokers in partition_broker_map.items():
+            broker_partition_leader_counts[brokers[0]] += 1
+            for broker_num in brokers:
+                broker_partition_counts[broker_num] += 1
+
+    for broker_num in target_brokers:
+        logging.info('Broker %(broker_num)s will lead %(partition_leader_count)s'
+                     ' of %(partition_count)s topic partitions.',
+                     {'broker_num': broker_num,
+                      'partition_leader_count': broker_partition_leader_counts[broker_num],
+                      'partition_count': broker_partition_counts[broker_num]})
+
+    assignment_json = {
+        'version': 1,
+        'partitions': [
+            {
+                'topic': topic_name,
+                'partition': partition_num,
+                'replicas': replica_brokers
+            }
+            for topic_name, partitions in sorted(changed_topic_partition_broker_map.items())
+            for partition_num, replica_brokers in sorted(partitions.items())
+        ]
+    }
+
+    json.dump(assignment_json, sys.stdout, separators=(',', ':'), sort_keys=True)
+    sys.stdout.write('\n')
+    sys.stdout.flush()
 
 
 @click.command()
@@ -134,14 +555,16 @@ def watermark(when,
         bootstrap_servers=bootstrap_brokers,
         value_deserializer=value_deserializer,
         key_deserializer=key_deserializer,
+        api_version=(1, 1, 1),
     )
 
     client = consumer._client
 
     node = client.least_loaded_node()
+    ensure_node_connected(client, node)
 
     request = MetadataRequest[1](topic)
-    f = client.send(node, request)
+    f = client.send(node, request, wakeup=False)
     client.poll(future=f)
     if f.failed():
         raise f.exception
@@ -163,6 +586,8 @@ def watermark(when,
     current_offsets = {}
     for node, topic_map in nodes_map.items():
 
+        ensure_node_connected(client, node)
+
         request = OffsetRequest[1](
             -1,
             [(topic,
@@ -170,12 +595,8 @@ def watermark(when,
                for partition in partitions])
              for topic, partitions in topic_map.items()]
         )
-        # Seem to need to poll to allow connections to
-        # nodes to complete.
-        while not client.ready(node):
-            client.poll()
-            time.sleep(0.1)
-        f = client.send(node, request)
+
+        f = client.send(node, request, wakeup=False)
         client.poll(future=f)
         if f.failed():
             raise f.exception
@@ -249,11 +670,13 @@ def fetch(topic,
         value_deserializer=value_deserializer,
         key_deserializer=key_deserializer,
         consumer_timeout_ms=fetch_timeout * 1000,
+        api_version=(1, 1, 1),
     )
 
     client = consumer._client
 
     node = client.least_loaded_node()
+    ensure_node_connected(client, node)
 
     topic_dict = {}
 
@@ -498,7 +921,7 @@ def position(consumer_group,
             partitions = [int(p) for p in partition_spec.split(',')]
         else:
             # TODO: how to find this per topic...
-            partitions = range(12)
+            partitions = range(24)
 
         for partition in partitions:
             tp = TopicPartition(topic, partition)
@@ -514,6 +937,7 @@ def position(consumer_group,
             key_deserializer=key_deserializer,
             group_id=consumer_group,
             enable_auto_commit=False,
+            api_version=(1, 1, 1),
         )
 
         consumer.assign(topic_partitons)
@@ -600,6 +1024,7 @@ def seek(consumer_group,
             key_deserializer=key_deserializer,
             group_id=consumer_group,
             enable_auto_commit=False,
+            api_version=(1, 1, 1),
         )
 
         consumer.assign(topic_dict.keys())
@@ -690,6 +1115,7 @@ def consume(topic,
         consumer_timeout_ms=fetch_timeout * 1000,
         group_id=consumer_group,
         max_partition_fetch_bytes=32 * 1024 * 1024,  # 32MB, default 1MB
+        api_version=(1, 1, 1),
     )
 
     try:
@@ -789,6 +1215,7 @@ def produce(topic,
         # TODO: make these configurable?
         linger_ms=200,
         batch_size=512 * 1024,  # 512kB, default 16kB
+        api_version=(1, 1, 1),
     )
 
     def free_queue_space(produce_buffer, ensure_space=False):
@@ -933,6 +1360,7 @@ def pipe(source_topic,
         group_id=consumer_group,
         enable_auto_commit=False,
         max_partition_fetch_bytes=32 * 1024 * 1024,  # 32MB, default 1MB
+        api_version=(1, 1, 1),
     )
 
     producer = KafkaProducer(
@@ -945,6 +1373,7 @@ def pipe(source_topic,
         # TODO: make these configurable?
         linger_ms=200,
         batch_size=512 * 1024,  # 512kB, default 16kB
+        api_version=(1, 1, 1),
     )
 
     commit_interval = consumer.config['auto_commit_interval_ms'] / 1000
@@ -1031,6 +1460,102 @@ def pipe(source_topic,
     consumer.close(autocommit=False)
 
 
+@click.command()
+@click.argument('source_topic')
+@click.argument('destination_topic')
+@click.option('-b', '--bootstrap-brokers', default='localhost',
+              help='Addresses of brokers in a Kafka cluster to talk to.' +
+                   ' Brokers should be separated by commas' +
+                   ' e.g. broker1,broker2.' +
+                   ' Ports can be provided if non-standard (9092)' +
+                   ' e.g. broker1:9999. (default: localhost)')
+@click.option('-g', '--consumer-group', default=None,
+              help='The consumer group to use. Offsets will be periodically' +
+                   ' committed.' +
+                   ' Consumption will start from the committed offsets,' +
+                   ' if available.')
+@click.option('-t', '--fetch-timeout', type=float, default=float('inf'),
+              help='How many seconds to wait for a message when fetching before ' +
+                   'exiting. (default=indefinitely)')
+@click.option('-e', '--default-earliest-offset', is_flag=True,
+              help='Default to consuming from the earlest available offset if' +
+                   ' no committed offset is available.')
+@click.option('-c', '--compression', type=click.Choice(['snappy']),
+              help='Which compression to use when producing messages. (default: None)')
+@click.option('-v', '--verbose', is_flag=True,
+              help='Turn on verbose logging.')
+@click.option('-vv', '--very-verbose', is_flag=True,
+              help='Turn on very verbose logging.')
+def spipe(source_topic,
+          destination_topic,
+          bootstrap_brokers,
+          consumer_group,
+          fetch_timeout,
+          default_earliest_offset,
+          compression,
+          verbose,
+          very_verbose):
+    '''Consume messages from a Kafka topic, and produce to another Kafka topic.
+       By default, connect to a kafka cluster at localhost:9092 and consume new
+       messages on the source topic indefinitely, producing to the destination topic.'''
+
+    logging.basicConfig(
+        format='[%(asctime)s] %(name)s.%(levelname)s %(threadName)s %(message)s',
+        level=logging.DEBUG if very_verbose else
+               logging.INFO if verbose else
+               logging.WARNING
+    )
+    logging.captureWarnings(True)
+
+    bootstrap_brokers = bootstrap_brokers.split(',')
+
+    consumer = KafkaConsumer(
+        bootstrap_servers=bootstrap_brokers,
+        value_deserializer=value_deserializer,
+        key_deserializer=key_deserializer,
+        auto_offset_reset='earliest' if default_earliest_offset else 'latest',
+        consumer_timeout_ms=min(fetch_timeout * 1000, 500),
+        group_id=consumer_group,
+        max_partition_fetch_bytes=32 * 1024 * 1024,  # 32MB, default 1MB
+        api_version=(1, 1, 1),
+    )
+
+    producer = KafkaProducer(
+        bootstrap_servers=bootstrap_brokers,
+        value_serializer=value_serializer,
+        key_serializer=key_serializer,
+        # TODO: make configurable
+        acks='all',
+        compression_type=compression,
+        # TODO: make these configurable?
+        linger_ms=200,
+        batch_size=512 * 1024,  # 512kB, default 16kB
+        api_version=(1, 1, 1),
+    )
+
+    consumer.subscribe(topics=[source_topic])
+
+    last_message_time = time.monotonic()
+    try:
+        while time.monotonic() < (last_message_time + fetch_timeout):
+            for m in consumer:
+                last_message_time = time.monotonic()
+
+                args = {'topic': destination_topic, 'key': m.key, 'value': m.value}
+                fut = producer.send(**args)
+                logging.info('Starting waiting for produce future')
+                fut.get()
+                logging.info('Finished waiting for produce future')
+
+    except KeyboardInterrupt:
+        pass
+
+    producer.flush()
+    producer.close()
+    consumer.close(autocommit=False)
+
+
+main.add_command(metadata)
 main.add_command(watermark)
 main.add_command(fetch)
 main.add_command(position)
@@ -1038,3 +1563,4 @@ main.add_command(seek)
 main.add_command(consume)
 main.add_command(produce)
 main.add_command(pipe)
+main.add_command(spipe)

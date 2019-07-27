@@ -22,7 +22,9 @@ setup(
     install_requires=[
         'click',
         'crc32c',
-        'kafka-python==1.4.4',
+        # 'kafka-python @ git+git://github.com/dpkp/kafka-python@51313d792a24059d003f5647ec531cfd9d62d7ab',
+        # 'kafka-python @ git+git://github.com/braedon/kafka-python@5a50756132cb328e2c256dc0f6ca896b997ec23a',
+        'kafka-python==1.4.6',
         'python-snappy',
         'tonyg-rfc3339',
     ],
